@@ -42,47 +42,68 @@ function App() {
 
   useEffect(() => { loadFFmpeg(); fetchProjects(); }, []);
 
-  // Playback engine
+  // Playback engine — let the video drive the playhead, not the other way around
   useEffect(() => {
-    if (isPlaying) {
-      const startTime = Date.now();
-      const startPlayhead = playhead;
-      playIntervalRef.current = setInterval(() => {
-        const elapsed = (Date.now() - startTime) / 1000;
-        const newTime = startPlayhead + elapsed;
-        const total = getTotalDuration();
-        if (newTime >= total) {
-          setPlayhead(total);
-          setIsPlaying(false);
-          clearInterval(playIntervalRef.current);
-        } else {
-          setPlayhead(newTime);
-          syncVideoToPlayhead(newTime);
-        }
-      }, 33); // ~30fps update
-      return () => clearInterval(playIntervalRef.current);
-    } else {
-      if (playIntervalRef.current) clearInterval(playIntervalRef.current);
-    }
+    if (!isPlaying) return;
+    // Start the current clip playing
+    syncVideoToPlayhead(playhead, false);
+    if (videoRef.current && videoRef.current.paused) videoRef.current.play();
   }, [isPlaying]);
 
-  function syncVideoToPlayhead(time) {
+  // Video timeupdate drives the playhead
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    const onTimeUpdate = () => {
+      if (!isPlaying) return;
+      // Find current clip to calculate global time
+      const v1 = tracks[0];
+      const clip = v1.clips.find(c => c.id === activeClipId);
+      if (!clip) return;
+      const globalTime = clip.startOnTimeline + (v.currentTime - clip.trimStart);
+      setPlayhead(globalTime);
+    };
+    const onEnded = () => {
+      if (!isPlaying) return;
+      // Find next clip
+      const v1 = tracks[0];
+      const idx = v1.clips.findIndex(c => c.id === activeClipId);
+      if (idx >= 0 && idx < v1.clips.length - 1) {
+        const nextClip = v1.clips[idx + 1];
+        setActiveClipId(nextClip.id);
+        setPreviewUrl(nextClip.asset.url);
+        setSelectedAsset(nextClip.asset);
+        setPlayhead(nextClip.startOnTimeline);
+        setTimeout(() => {
+          if (videoRef.current) { videoRef.current.currentTime = nextClip.trimStart; videoRef.current.play(); }
+        }, 100);
+      } else {
+        setIsPlaying(false);
+      }
+    };
+    v.addEventListener('timeupdate', onTimeUpdate);
+    v.addEventListener('ended', onEnded);
+    return () => { v.removeEventListener('timeupdate', onTimeUpdate); v.removeEventListener('ended', onEnded); };
+  }, [isPlaying, activeClipId, tracks]);
+
+  function syncVideoToPlayhead(time, forceSeek) {
     // Find clip at this time on V1
     const v1 = tracks[0];
     const clip = v1.clips.find(c => time >= c.startOnTimeline && time < c.startOnTimeline + c.duration);
     if (clip) {
       const localTime = clip.trimStart + (time - clip.startOnTimeline);
       if (activeClipId !== clip.id) {
+        // Switching to new clip
         setActiveClipId(clip.id);
         setPreviewUrl(clip.asset.url);
         setSelectedAsset(clip.asset);
         setTimeout(() => {
-          if (videoRef.current) { videoRef.current.currentTime = localTime; if (isPlaying) videoRef.current.play(); }
+          if (videoRef.current) { videoRef.current.currentTime = localTime; videoRef.current.play(); }
         }, 100);
-      } else if (videoRef.current) {
-        // Only seek if drift > 0.3s
-        if (Math.abs(videoRef.current.currentTime - localTime) > 0.3) videoRef.current.currentTime = localTime;
+      } else if (forceSeek && videoRef.current) {
+        videoRef.current.currentTime = localTime;
       }
+      // During normal playback: do NOT seek — let video play naturally
     } else {
       if (activeClipId) { setActiveClipId(null); setPreviewUrl(null); if (videoRef.current) videoRef.current.pause(); }
     }
@@ -308,7 +329,7 @@ function App() {
       const x = (ev.clientX || e.clientX) - rect.left + (timelineScrollRef.current?.scrollLeft || 0);
       const t = Math.max(0, Math.min(x / zoom, getTotalDuration()));
       setPlayhead(t);
-      syncVideoToPlayhead(t);
+      syncVideoToPlayhead(t, true);
     };
     updatePlayhead(e);
     const onMove = (ev) => {
@@ -316,8 +337,9 @@ function App() {
       const x = ev.clientX - rect.left + (timelineScrollRef.current?.scrollLeft || 0);
       const t = Math.max(0, Math.min(x / zoom, getTotalDuration()));
       setPlayhead(t);
+      syncVideoToPlayhead(t, true);
     };
-    const onUp = () => { document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); syncVideoToPlayhead(playhead); };
+    const onUp = () => { document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); };
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
   }
@@ -449,9 +471,9 @@ function App() {
             <div style={{ fontFamily: 'monospace', fontSize: '13px', color: '#4f8ef7', letterSpacing: '1px' }}>{formatTC(playhead)}</div>
             <div style={{ display: 'flex', gap: '2px' }}>
               <button onClick={() => setPlayhead(0)} style={S.tBtn}>⏮</button>
-              <button onClick={() => { setPlayhead(Math.max(0, playhead - 1/30)); syncVideoToPlayhead(playhead - 1/30); }} style={S.tBtn}>◀</button>
+              <button onClick={() => { const t = Math.max(0, playhead - 1/30); setPlayhead(t); syncVideoToPlayhead(t, true); }} style={S.tBtn}>◀</button>
               <button onClick={togglePlay} style={{ ...S.tBtn, background: isPlaying ? '#e74c3c' : '#4f8ef7', color: '#fff', width: '36px', fontWeight: 700 }}>{isPlaying ? '⏸' : '▶'}</button>
-              <button onClick={() => { setPlayhead(Math.min(totalDur, playhead + 1/30)); syncVideoToPlayhead(playhead + 1/30); }} style={S.tBtn}>▶</button>
+              <button onClick={() => { const t = Math.min(totalDur, playhead + 1/30); setPlayhead(t); syncVideoToPlayhead(t, true); }} style={S.tBtn}>▶</button>
               <button onClick={() => setPlayhead(totalDur)} style={S.tBtn}>⏭</button>
             </div>
             <div style={{ fontFamily: 'monospace', fontSize: '13px', color: '#888', letterSpacing: '1px' }}>{formatTC(totalDur)}</div>
