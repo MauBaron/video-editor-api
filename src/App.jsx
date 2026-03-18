@@ -87,13 +87,12 @@ function App() {
   }, [isPlaying, activeClipId, tracks]);
 
   function syncVideoToPlayhead(time, forceSeek) {
-    // Find clip at this time on V1
     const v1 = tracks[0];
-    const clip = v1.clips.find(c => time >= c.startOnTimeline && time < c.startOnTimeline + c.duration);
+    const sortedClips = [...v1.clips].sort((a, b) => a.startOnTimeline - b.startOnTimeline);
+    const clip = sortedClips.find(c => time >= c.startOnTimeline && time < c.startOnTimeline + c.duration);
     if (clip) {
       const localTime = clip.trimStart + (time - clip.startOnTimeline);
       if (activeClipId !== clip.id) {
-        // Switching to new clip
         setActiveClipId(clip.id);
         setPreviewUrl(clip.asset.url);
         setSelectedAsset(clip.asset);
@@ -103,9 +102,21 @@ function App() {
       } else if (forceSeek && videoRef.current) {
         videoRef.current.currentTime = localTime;
       }
-      // During normal playback: do NOT seek — let video play naturally
     } else {
-      if (activeClipId) { setActiveClipId(null); setPreviewUrl(null); if (videoRef.current) videoRef.current.pause(); }
+      // In a gap — find next clip and skip to it
+      const nextClip = sortedClips.find(c => c.startOnTimeline > time);
+      if (nextClip) {
+        setPlayhead(nextClip.startOnTimeline);
+        setActiveClipId(nextClip.id);
+        setPreviewUrl(nextClip.asset.url);
+        setSelectedAsset(nextClip.asset);
+        setTimeout(() => {
+          if (videoRef.current) { videoRef.current.currentTime = nextClip.trimStart; videoRef.current.play(); }
+        }, 100);
+      } else {
+        // No more clips
+        if (activeClipId) { setActiveClipId(null); setPreviewUrl(null); if (videoRef.current) videoRef.current.pause(); }
+      }
     }
   }
 
@@ -355,6 +366,65 @@ function App() {
     }
   }
 
+  // Export all V1 clips merged into one video
+  async function exportAll() {
+    const v1 = tracks[0];
+    const clips = [...v1.clips].sort((a, b) => a.startOnTimeline - b.startOnTimeline);
+    if (!clips.length) { setStatus('No clips to export'); return; }
+    if (!ffmpegLoaded) { setStatus('FFmpeg not loaded yet'); return; }
+
+    setLoading(true);
+    setStatus('Preparing export...');
+    const ffmpeg = ffmpegRef.current;
+
+    // Download and trim each clip
+    const fileList = [];
+    for (let i = 0; i < clips.length; i++) {
+      const clip = clips[i];
+      setStatus(`Downloading clip ${i + 1}/${clips.length}...`);
+      const resp = await fetch(clip.asset.url);
+      const data = new Uint8Array(await resp.arrayBuffer());
+      const inputName = `input_${i}.mp4`;
+      await ffmpeg.writeFile(inputName, data);
+
+      // Trim if needed
+      const trimmedName = `trimmed_${i}.mp4`;
+      if (clip.trimStart > 0 || clip.trimEnd < clip.asset.duration) {
+        setStatus(`Trimming clip ${i + 1}/${clips.length}...`);
+        await ffmpeg.exec(['-i', inputName, '-ss', String(clip.trimStart), '-to', String(clip.trimEnd), '-c', 'copy', '-avoid_negative_ts', '1', trimmedName]);
+      } else {
+        await ffmpeg.exec(['-i', inputName, '-c', 'copy', trimmedName]);
+      }
+      fileList.push(trimmedName);
+    }
+
+    // Create concat file
+    const concatContent = fileList.map(f => `file '${f}'`).join('\n');
+    await ffmpeg.writeFile('concat.txt', new TextEncoder().encode(concatContent));
+
+    setStatus('Merging clips...');
+    await ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c', 'copy', 'export.mp4']);
+
+    const output = await ffmpeg.readFile('export.mp4');
+    const blob = new Blob([output.buffer], { type: 'video/mp4' });
+    const url = URL.createObjectURL(blob);
+
+    // Trigger download
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${currentProject.name}_export.mp4`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    // Cleanup
+    for (const f of fileList) { try { await ffmpeg.deleteFile(f); } catch(e){} }
+    try { await ffmpeg.deleteFile('concat.txt'); await ffmpeg.deleteFile('export.mp4'); } catch(e){}
+    for (let i = 0; i < clips.length; i++) { try { await ffmpeg.deleteFile(`input_${i}.mp4`); } catch(e){} }
+
+    setStatus('Export complete!'); setLoading(false); setProgress(0);
+    setTimeout(() => setStatus('Ready'), 3000);
+  }
+
   function selectClipForPreview(clip) {
     setSelectedAsset(clip.asset);
     setPreviewUrl(clip.asset.url);
@@ -493,11 +563,12 @@ function App() {
               <div style={{ marginBottom: '4px' }}><kbd style={S.kbd}>Space</kbd> Play/Pause</div>
               <div style={{ marginBottom: '4px' }}><kbd style={S.kbd}>Del</kbd> Delete clip</div>
             </div>
+            <div style={{ height: '1px', background: '#333', margin: '8px 0' }} />
+            <button onClick={exportAll} disabled={loading || !ffmpegLoaded || !tracks[0].clips.length} style={{ ...S.effectBtn, background: '#4f8ef7', color: '#fff', borderRadius: '4px', fontWeight: 600, justifyContent: 'center' }}>
+              🎬 Export Timeline
+            </button>
             {selectedAsset && (
-              <>
-                <div style={{ height: '1px', background: '#333', margin: '8px 0' }} />
-                <a href={selectedAsset.url} download={selectedAsset.filename} style={S.effectBtn}>⬇️ Export Selected</a>
-              </>
+              <a href={selectedAsset.url} download={selectedAsset.filename} style={S.effectBtn}>⬇️ Download Clip</a>
             )}
             {!ffmpegLoaded && <div style={{ color: '#f0ad4e', fontSize: '10px', padding: '8px' }}>Loading engine...</div>}
           </div>
