@@ -1,12 +1,13 @@
 {
-  "name": "video-editor-api",
+  "name": "video-editor",
   "version": "1.0.0",
-  "description": "Simple video editor API with Supabase",
-  "main": "server/index.js",
-  "type": "module",
+  "private": true,
   "scripts": {
-    "start": "node server/index.js",
-    "dev": "node --watch server/index.js"
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "dev:client": "vite",
+    "dev:server": "node server/index.js",
+    "build": "vite build",
+    "preview": "vite preview"
   },
   "dependencies": {
     "express": "^4.18.2",
@@ -16,6 +17,13 @@
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "uuid": "^9.0.1",
-    "@ffmpeg-installer/ffmpeg": "^1.1.0"
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.1",
+    "vite": "^5.0.8",
+    "concurrently": "^8.2.2"
   }
 }
