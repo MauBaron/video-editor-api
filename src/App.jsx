@@ -22,7 +22,7 @@ function App() {
   const [playhead, setPlayhead] = useState(0); // seconds
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
-  const [sequenceSettings, setSequenceSettings] = useState({ width: 1080, height: 1920, fps: 30 });
+  const [sequenceSettings, setSequenceSettings] = useState({ width: 1080, height: 1920, fps: 30, label: '9:16 Vertical' });
   const [showSeqSettings, setShowSeqSettings] = useState(false);
   const [dragOverTimeline, setDragOverTimeline] = useState(false);
   const [draggingAsset, setDraggingAsset] = useState(null);
@@ -404,8 +404,10 @@ function App() {
           </div>
           <div style={S.monitor}>
             {previewUrl ? (
-              <video ref={videoRef} src={previewUrl} style={{ maxWidth: '100%', maxHeight: '100%', aspectRatio: `${sequenceSettings.width}/${sequenceSettings.height}` }}
-                onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime || 0)} />
+              <video ref={videoRef} src={previewUrl} controls crossOrigin="anonymous"
+                style={{ maxWidth: '100%', maxHeight: '100%', aspectRatio: '9/16' }}
+                onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime || 0)}
+                onLoadedData={() => { if (videoRef.current) videoRef.current.play(); }} />
             ) : (
               <div style={{ color: '#444', fontSize: '13px' }}>Select a clip to preview</div>
             )}
@@ -537,7 +539,7 @@ const S = {
   xBtn: { background: 'none', border: 'none', color: '#555', cursor: 'pointer', fontSize: '14px' },
   empty: { color: '#444', textAlign: 'center', padding: '20px', fontSize: '11px' },
 
-  monitor: { flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#000', margin: '4px', borderRadius: '2px' },
+  monitor: { flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#000', margin: '4px', borderRadius: '2px', overflow: 'hidden' },
   transport: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '4px 12px', background: '#2d2d2d', borderTop: '1px solid #3e3e3e' },
   transportBtn: { width: '28px', height: '24px', background: '#333', border: '1px solid #444', borderRadius: '3px', color: '#ccc', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '10px' },
   timecode: { fontFamily: 'monospace', fontSize: '12px', color: '#4f8ef7', letterSpacing: '1px' },
