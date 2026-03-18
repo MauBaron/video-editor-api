@@ -21,7 +21,8 @@ function App() {
   const [timeline, setTimeline] = useState([]); // ordered clips on timeline
   const [playhead, setPlayhead] = useState(0); // seconds
   const [isPlaying, setIsPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0); // global timeline time
+  const [activeClipIndex, setActiveClipIndex] = useState(-1);
   const [sequenceSettings, setSequenceSettings] = useState({ width: 1080, height: 1920, fps: 30, label: '9:16 Vertical' });
   const [showSeqSettings, setShowSeqSettings] = useState(false);
   const [dragOverTimeline, setDragOverTimeline] = useState(false);
@@ -35,16 +36,54 @@ function App() {
 
   useEffect(() => { loadFFmpeg(); fetchProjects(); }, []);
 
-  // Sync video time to playhead
+  // Get clip start time on global timeline
+  function getClipStartTime(idx) {
+    let t = 0;
+    for (let i = 0; i < idx; i++) t += (timeline[i]?.duration || 0);
+    return t;
+  }
+
+  // Find which clip a global time falls in
+  function getClipAtTime(globalTime) {
+    let t = 0;
+    for (let i = 0; i < timeline.length; i++) {
+      const dur = timeline[i]?.duration || 0;
+      if (globalTime < t + dur) return { index: i, localTime: globalTime - t };
+      t += dur;
+    }
+    return { index: -1, localTime: 0 };
+  }
+
+  // Playback engine: track global time, switch clips automatically
   useEffect(() => {
-    if (!videoRef.current) return;
+    if (!videoRef.current || !isPlaying) return;
     const v = videoRef.current;
-    const onTime = () => setCurrentTime(v.currentTime);
-    const onEnd = () => setIsPlaying(false);
-    v.addEventListener('timeupdate', onTime);
-    v.addEventListener('ended', onEnd);
-    return () => { v.removeEventListener('timeupdate', onTime); v.removeEventListener('ended', onEnd); };
-  }, [previewUrl]);
+
+    const onTimeUpdate = () => {
+      if (activeClipIndex < 0) return;
+      const clipStart = getClipStartTime(activeClipIndex);
+      const globalT = clipStart + v.currentTime;
+      setCurrentTime(globalT);
+      setPlayhead(globalT);
+    };
+
+    const onEnded = () => {
+      // Move to next clip
+      const nextIdx = activeClipIndex + 1;
+      if (nextIdx < timeline.length) {
+        setActiveClipIndex(nextIdx);
+        setSelectedAsset(timeline[nextIdx]);
+        setPreviewUrl(timeline[nextIdx].url);
+        // Will auto-play via onLoadedData
+      } else {
+        setIsPlaying(false);
+      }
+    };
+
+    v.addEventListener('timeupdate', onTimeUpdate);
+    v.addEventListener('ended', onEnded);
+    return () => { v.removeEventListener('timeupdate', onTimeUpdate); v.removeEventListener('ended', onEnded); };
+  }, [isPlaying, activeClipIndex, timeline]);
 
   async function loadFFmpeg() {
     setStatus('Loading FFmpeg engine...');
@@ -184,34 +223,50 @@ function App() {
   function seekToTime(time) {
     setPlayhead(time);
     setCurrentTime(time);
-    // Find which clip this falls in
-    let accumulated = 0;
-    for (const clip of timeline) {
-      const dur = clip.duration || 0;
-      if (time < accumulated + dur) {
-        setSelectedAsset(clip);
-        setPreviewUrl(clip.url);
-        // Seek within clip
+    const { index, localTime } = getClipAtTime(time);
+    if (index >= 0) {
+      setActiveClipIndex(index);
+      setSelectedAsset(timeline[index]);
+      if (previewUrl !== timeline[index].url) {
+        setPreviewUrl(timeline[index].url);
+        // Wait for video to load then seek
         setTimeout(() => {
           if (videoRef.current) {
-            videoRef.current.currentTime = time - accumulated;
+            videoRef.current.currentTime = localTime;
+            if (!isPlaying) videoRef.current.pause();
           }
-        }, 100);
-        return;
+        }, 200);
+      } else {
+        if (videoRef.current) videoRef.current.currentTime = localTime;
       }
-      accumulated += dur;
+    } else {
+      // Past all clips — go to black
+      setPreviewUrl(null);
+      setSelectedAsset(null);
+      setActiveClipIndex(-1);
     }
   }
 
   function togglePlay() {
-    if (!videoRef.current) return;
     if (isPlaying) {
-      videoRef.current.pause();
+      if (videoRef.current) videoRef.current.pause();
       setIsPlaying(false);
-    } else {
-      videoRef.current.play();
-      setIsPlaying(true);
+      return;
     }
+    // Start playing from current position
+    if (timeline.length === 0) return;
+    let { index, localTime } = getClipAtTime(playhead);
+    if (index < 0) { index = 0; localTime = 0; setPlayhead(0); setCurrentTime(0); }
+    setActiveClipIndex(index);
+    setSelectedAsset(timeline[index]);
+    setPreviewUrl(timeline[index].url);
+    setIsPlaying(true);
+    setTimeout(() => {
+      if (videoRef.current) {
+        videoRef.current.currentTime = localTime;
+        videoRef.current.play();
+      }
+    }, 150);
   }
 
   function selectClipForPreview(asset) {
@@ -406,8 +461,7 @@ function App() {
             {previewUrl ? (
               <video ref={videoRef} src={previewUrl} controls crossOrigin="anonymous"
                 style={{ maxWidth: '100%', maxHeight: '100%', aspectRatio: '9/16' }}
-                onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime || 0)}
-                onLoadedData={() => { if (videoRef.current) videoRef.current.play(); }} />
+                onLoadedData={() => { if (videoRef.current && isPlaying) videoRef.current.play(); }} />
             ) : (
               <div style={{ color: '#444', fontSize: '13px' }}>Select a clip to preview</div>
             )}
@@ -475,7 +529,8 @@ function App() {
                 style={{
                   ...S.clip,
                   width: `${Math.max((clip.duration || 5) * zoom, 40)}px`,
-                  ...(selectedAsset?.id === clip.id ? { border: '1px solid #4f8ef7', background: '#3a5a8a' } : {})
+                  ...(activeClipIndex === idx ? { border: '1px solid #4f8ef7', background: '#3a5a8a' } : {}),
+                  ...(selectedAsset?.id === clip.id && activeClipIndex !== idx ? { border: '1px solid #666' } : {})
                 }}>
                 <div style={S.clipName}>{clip.filename}</div>
                 <div style={S.clipDur}>{formatTC(clip.duration)}</div>
