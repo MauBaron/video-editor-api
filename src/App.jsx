@@ -34,6 +34,8 @@ function App() {
   const [trimming, setTrimming] = useState(null); // { trackIdx, clipIdx, edge: 'left'|'right', startX, origTrimStart, origTrimEnd, origStart }
   const [draggingClip, setDraggingClip] = useState(null);
   const [scrollLeft, setScrollLeft] = useState(0);
+  const [inPoint, setInPoint] = useState(null); // mark in
+  const [outPoint, setOutPoint] = useState(null); // mark out
 
   const ffmpegRef = useRef(new FFmpeg());
   const videoRef = useRef(null);
@@ -366,60 +368,95 @@ function App() {
     }
   }
 
-  // Export all V1 clips merged into one video
+  // Export timeline from in-point to out-point (or first frame to last frame if not set)
   async function exportAll() {
     const v1 = tracks[0];
     const clips = [...v1.clips].sort((a, b) => a.startOnTimeline - b.startOnTimeline);
     if (!clips.length) { setStatus('No clips to export'); return; }
     if (!ffmpegLoaded) { setStatus('FFmpeg not loaded yet'); return; }
 
+    // Determine export range
+    const firstFrame = clips[0].startOnTimeline;
+    const lastFrame = Math.max(...clips.map(c => c.startOnTimeline + c.duration));
+    const exportStart = inPoint !== null ? inPoint : firstFrame;
+    const exportEnd = outPoint !== null ? outPoint : lastFrame;
+    const exportDuration = exportEnd - exportStart;
+    if (exportDuration <= 0) { setStatus('Invalid export range'); return; }
+
     setLoading(true);
     setStatus('Preparing export...');
     const ffmpeg = ffmpegRef.current;
 
-    // Download and trim each clip
-    const fileList = [];
-    for (let i = 0; i < clips.length; i++) {
-      const clip = clips[i];
-      setStatus(`Downloading clip ${i + 1}/${clips.length}...`);
-      const resp = await fetch(clip.asset.url);
-      const data = new Uint8Array(await resp.arrayBuffer());
-      const inputName = `input_${i}.mp4`;
-      await ffmpeg.writeFile(inputName, data);
+    // Filter clips that overlap with export range
+    const relevantClips = clips.filter(c => {
+      const clipEnd = c.startOnTimeline + c.duration;
+      return clipEnd > exportStart && c.startOnTimeline < exportEnd;
+    });
 
-      // Trim if needed
-      const trimmedName = `trimmed_${i}.mp4`;
-      if (clip.trimStart > 0 || clip.trimEnd < clip.asset.duration) {
-        setStatus(`Trimming clip ${i + 1}/${clips.length}...`);
-        await ffmpeg.exec(['-i', inputName, '-ss', String(clip.trimStart), '-to', String(clip.trimEnd), '-c', 'copy', '-avoid_negative_ts', '1', trimmedName]);
-      } else {
-        await ffmpeg.exec(['-i', inputName, '-c', 'copy', trimmedName]);
+    // Build segments: black gaps + clip portions
+    const segments = [];
+    let cursor = exportStart;
+
+    for (const clip of relevantClips) {
+      const clipEnd = clip.startOnTimeline + clip.duration;
+      const overlapStart = Math.max(clip.startOnTimeline, exportStart);
+      const overlapEnd = Math.min(clipEnd, exportEnd);
+
+      // Gap before this clip
+      if (overlapStart > cursor) {
+        const gapDur = overlapStart - cursor;
+        segments.push({ type: 'black', duration: gapDur });
       }
-      fileList.push(trimmedName);
+
+      // Clip portion
+      const localStart = clip.trimStart + (overlapStart - clip.startOnTimeline);
+      const localEnd = clip.trimStart + (overlapEnd - clip.startOnTimeline);
+      segments.push({ type: 'clip', asset: clip.asset, from: localStart, to: localEnd, duration: overlapEnd - overlapStart });
+      cursor = overlapEnd;
     }
 
-    // Create concat file
+    // Trailing gap
+    if (cursor < exportEnd) {
+      segments.push({ type: 'black', duration: exportEnd - cursor });
+    }
+
+    // Process each segment
+    const fileList = [];
+    let segIdx = 0;
+    for (const seg of segments) {
+      if (seg.type === 'black') {
+        setStatus(`Generating gap ${segIdx + 1}...`);
+        const name = `seg_${segIdx}.mp4`;
+        await ffmpeg.exec(['-f', 'lavfi', '-i', `color=c=black:s=1080x1920:r=30:d=${seg.duration}`, '-c:v', 'libx264', '-t', String(seg.duration), '-pix_fmt', 'yuv420p', name]);
+        fileList.push(name);
+      } else {
+        setStatus(`Processing clip ${segIdx + 1}/${segments.length}...`);
+        const inputName = `input_${segIdx}.mp4`;
+        const resp = await fetch(seg.asset.url);
+        await ffmpeg.writeFile(inputName, new Uint8Array(await resp.arrayBuffer()));
+        const name = `seg_${segIdx}.mp4`;
+        await ffmpeg.exec(['-i', inputName, '-ss', String(seg.from), '-to', String(seg.to), '-c:v', 'libx264', '-c:a', 'aac', '-avoid_negative_ts', '1', '-pix_fmt', 'yuv420p', name]);
+        fileList.push(name);
+      }
+      segIdx++;
+    }
+
+    // Concat
     const concatContent = fileList.map(f => `file '${f}'`).join('\n');
     await ffmpeg.writeFile('concat.txt', new TextEncoder().encode(concatContent));
-
-    setStatus('Merging clips...');
+    setStatus('Merging...');
     await ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c', 'copy', 'export.mp4']);
 
     const output = await ffmpeg.readFile('export.mp4');
     const blob = new Blob([output.buffer], { type: 'video/mp4' });
     const url = URL.createObjectURL(blob);
-
-    // Trigger download
     const a = document.createElement('a');
-    a.href = url;
-    a.download = `${currentProject.name}_export.mp4`;
-    a.click();
+    a.href = url; a.download = `${currentProject.name}_export.mp4`; a.click();
     URL.revokeObjectURL(url);
 
     // Cleanup
-    for (const f of fileList) { try { await ffmpeg.deleteFile(f); } catch(e){} }
-    try { await ffmpeg.deleteFile('concat.txt'); await ffmpeg.deleteFile('export.mp4'); } catch(e){}
-    for (let i = 0; i < clips.length; i++) { try { await ffmpeg.deleteFile(`input_${i}.mp4`); } catch(e){} }
+    for (const f of [...fileList, 'concat.txt', 'export.mp4']) { try { await ffmpeg.deleteFile(f); } catch(e){} }
+    for (let i = 0; i < segments.length; i++) { try { await ffmpeg.deleteFile(`input_${i}.mp4`); } catch(e){} }
 
     setStatus('Export complete!'); setLoading(false); setProgress(0);
     setTimeout(() => setStatus('Ready'), 3000);
@@ -546,6 +583,11 @@ function App() {
               <button onClick={() => { const t = Math.min(totalDur, playhead + 1/30); setPlayhead(t); syncVideoToPlayhead(t, true); }} style={S.tBtn}>▶</button>
               <button onClick={() => setPlayhead(totalDur)} style={S.tBtn}>⏭</button>
             </div>
+            <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+              <button onClick={() => setInPoint(playhead)} style={{ ...S.tBtn, fontSize: '9px', width: '24px', background: inPoint !== null ? '#e74c3c' : '#333' }} title="Set In Point">I</button>
+              <button onClick={() => setOutPoint(playhead)} style={{ ...S.tBtn, fontSize: '9px', width: '24px', background: outPoint !== null ? '#e74c3c' : '#333' }} title="Set Out Point">O</button>
+              <button onClick={() => { setInPoint(null); setOutPoint(null); }} style={{ ...S.tBtn, fontSize: '8px', width: '24px' }} title="Clear In/Out">✕</button>
+            </div>
             <div style={{ fontFamily: 'monospace', fontSize: '13px', color: '#888', letterSpacing: '1px' }}>{formatTC(totalDur)}</div>
           </div>
         </div>
@@ -565,8 +607,11 @@ function App() {
             </div>
             <div style={{ height: '1px', background: '#333', margin: '8px 0' }} />
             <button onClick={exportAll} disabled={loading || !ffmpegLoaded || !tracks[0].clips.length} style={{ ...S.effectBtn, background: '#4f8ef7', color: '#fff', borderRadius: '4px', fontWeight: 600, justifyContent: 'center' }}>
-              🎬 Export Timeline
+              🎬 Export {inPoint !== null && outPoint !== null ? `[${formatTC(inPoint)}→${formatTC(outPoint)}]` : 'Timeline'}
             </button>
+            {inPoint !== null && outPoint !== null && (
+              <div style={{ padding: '4px 10px', fontSize: '10px', color: '#888' }}>Range: {formatTC(Math.abs(outPoint - inPoint))}</div>
+            )}
             {selectedAsset && (
               <a href={selectedAsset.url} download={selectedAsset.filename} style={S.effectBtn}>⬇️ Download Clip</a>
             )}
@@ -594,6 +639,12 @@ function App() {
                   {i}s
                 </div>
               ))}
+              {/* In/Out range highlight */}
+              {inPoint !== null && outPoint !== null && (
+                <div style={{ position: 'absolute', left: `${Math.min(inPoint, outPoint) * zoom}px`, width: `${Math.abs(outPoint - inPoint) * zoom}px`, top: 0, bottom: 0, background: 'rgba(79, 142, 247, 0.2)', zIndex: 5 }} />
+              )}
+              {inPoint !== null && <div style={{ position: 'absolute', left: `${inPoint * zoom}px`, top: 0, bottom: 0, width: '2px', background: '#4f8ef7', zIndex: 15 }} />}
+              {outPoint !== null && <div style={{ position: 'absolute', left: `${outPoint * zoom}px`, top: 0, bottom: 0, width: '2px', background: '#4f8ef7', zIndex: 15 }} />}
               {/* Playhead on ruler */}
               <div style={{ position: 'absolute', left: `${playhead * zoom}px`, top: 0, bottom: 0, width: '2px', background: '#ff4444', zIndex: 20 }}>
                 <div style={{ position: 'absolute', top: '-2px', left: '-6px', width: '14px', height: '14px', background: '#ff4444', clipPath: 'polygon(0 0, 100% 0, 50% 100%)', cursor: 'ew-resize' }} />
